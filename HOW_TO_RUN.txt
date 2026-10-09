@@ -1,0 +1,287 @@
+================================================================================
+  PROJECT FAIRNESS — HOW TO RUN  (Native / No Docker)
+  Generated: 2026-03-13
+================================================================================
+
+WHAT IS RUNNING NOW
+───────────────────
+  Service         URL                       PID log
+  ───────         ───                       ───────
+  FastAPI API     http://localhost:8000     /tmp/backend.log
+  React Frontend  http://localhost:5173     /tmp/frontend.log
+  Swagger UI      http://localhost:8000/docs
+  ReDoc           http://localhost:8000/redoc
+
+NOTE: Docker is NOT installed on this machine. Services run natively.
+      PostgreSQL 18 + Redis are installed but need sudo to start.
+      The backend currently runs off SQLite (no Postgres required).
+
+================================================================================
+  1. FASTAPI BACKEND  (port 8000)
+================================================================================
+
+Location:   /home/nexxus/Documents/Project Fairness/backend/
+Venv:       backend/.venv/
+DB:         SQLite → backend/app.db  (dev mode, auto-created on first start)
+ML mode:    DUMMY (random predictions, placeholder images — no model files needed)
+
+--- FIRST TIME SETUP (run once) ---
+
+  cd "/home/nexxus/Documents/Project Fairness/backend"
+
+  # Create virtual environment
+  python3 -m venv .venv
+
+  # Install dependencies
+  .venv/bin/pip install fastapi "uvicorn[standard]" python-multipart \
+      sqlalchemy aiosqlite pydantic pydantic-settings slowapi alembic pillow numpy
+
+  # Create .env (already done — file exists at backend/.env)
+  # Contents:
+  #   DATABASE_URL=sqlite+aiosqlite:///./app.db
+  #   ML_DUMMY_MODE=true
+  #   DIFFUSION_DUMMY_MODE=true
+  #   SECRET_KEY=local-dev-secret-key-change-in-production
+  #   ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+
+--- START BACKEND ---
+
+  cd "/home/nexxus/Documents/Project Fairness/backend"
+  ML_DUMMY_MODE=true DIFFUSION_DUMMY_MODE=true \
+    .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
+
+  # Background (saves log):
+  ML_DUMMY_MODE=true DIFFUSION_DUMMY_MODE=true \
+    nohup .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
+    > /tmp/backend.log 2>&1 &
+
+  # With hot-reload (development):
+  ML_DUMMY_MODE=true DIFFUSION_DUMMY_MODE=true \
+    .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+--- STOP BACKEND ---
+
+  pkill -f "uvicorn main:app"
+
+--- CHECK BACKEND ---
+
+  curl http://localhost:8000/health   # → {"status":"ok","version":"1.0.0"}
+  curl http://localhost:8000/ready    # → {"status":"ready",...}
+  curl http://localhost:8000/docs     # Swagger UI (open in browser)
+
+--- VIEW BACKEND LOGS ---
+
+  tail -f /tmp/backend.log
+  # or if running in foreground: logs go directly to terminal
+
+================================================================================
+  2. REACT FRONTEND  (port 5173)
+================================================================================
+
+Location:   /home/nexxus/Documents/Project Fairness/frontend/
+Framework:  Vite + React + Tailwind CSS
+Node:       v22.22.0
+npm:        9.2.0
+
+--- FIRST TIME SETUP (run once) ---
+
+  cd "/home/nexxus/Documents/Project Fairness/frontend"
+  npm install
+
+--- START FRONTEND ---
+
+  cd "/home/nexxus/Documents/Project Fairness/frontend"
+  npm run dev
+
+  # Background:
+  nohup npm run dev -- --host 0.0.0.0 --port 5173 > /tmp/frontend.log 2>&1 &
+
+  # Custom port:
+  npm run dev -- --port 3000
+
+--- STOP FRONTEND ---
+
+  pkill -f "vite"
+  # or press Ctrl+C in the terminal running it
+
+--- BUILD FOR PRODUCTION ---
+
+  cd "/home/nexxus/Documents/Project Fairness/frontend"
+  npm run build
+  # Output: frontend/dist/  (serve via nginx or any static file server)
+
+--- CHECK FRONTEND ---
+
+  curl -I http://localhost:5173   # → HTTP 200
+
+================================================================================
+  3. DATABASE  (PostgreSQL 18 — optional, SQLite used by default in dev)
+================================================================================
+
+PostgreSQL 18 is installed on this machine at:
+  Cluster:    pg_lsclusters → Ver 18, Port 5432
+  Data dir:   /var/lib/postgresql/18/main/
+  Log:        /var/log/postgresql/postgresql-18-main.log
+
+--- START POSTGRESQL (requires sudo) ---
+
+  sudo systemctl start postgresql
+  pg_isready -h localhost -p 5432   # confirm it's up
+
+--- CREATE DATABASE ---
+
+  sudo -u postgres psql -c "CREATE USER fairness WITH PASSWORD 'fairness_pass';"
+  sudo -u postgres psql -c "CREATE DATABASE skinlesion_db OWNER fairness;"
+
+--- SWITCH BACKEND TO POSTGRESQL ---
+
+  # Edit backend/.env:
+  DATABASE_URL=postgresql+asyncpg://fairness:fairness_pass@localhost:5432/skinlesion_db
+
+  # Run migrations:
+  cd "/home/nexxus/Documents/Project Fairness/backend"
+  .venv/bin/alembic upgrade head
+
+--- STOP POSTGRESQL ---
+
+  sudo systemctl stop postgresql
+
+================================================================================
+  4. REDIS  (optional — used by Celery for async tasks)
+================================================================================
+
+Redis is installed but NOT currently running.
+The API works without Redis (sync mode only).
+
+--- START REDIS (requires sudo) ---
+
+  sudo systemctl start redis
+  redis-cli ping   # → PONG
+
+--- STOP REDIS ---
+
+  sudo systemctl stop redis
+
+================================================================================
+  5. CELERY ML WORKER  (optional — for async image generation)
+================================================================================
+
+The Celery worker handles long-running diffusion model jobs asynchronously.
+Requires Redis to be running first.
+
+--- START CELERY WORKER ---
+
+  cd "/home/nexxus/Documents/Project Fairness/backend"
+  ML_DUMMY_MODE=true DIFFUSION_DUMMY_MODE=true \
+    .venv/bin/celery -A tasks worker \
+    --loglevel=info --concurrency=1 -Q generation
+
+  # Background:
+  nohup ... > /tmp/celery.log 2>&1 &
+
+================================================================================
+  6. ML SCRIPTS  (run separately when real models are available)
+================================================================================
+
+All ML training/eval scripts run from the project root with system Python3
+or a separate ML venv that includes torch, torchvision, etc.
+
+  # Train classifier:
+  python3 train_classifier.py --epochs 50 --batch_size 32
+
+  # Evaluate / compare models:
+  python3 evaluate_classifier.py \
+      --compare \
+      --baseline_ckpt results/baseline/best_model.pth \
+      --balanced_ckpt results/balanced/best_model.pth \
+      --test_csv splits/test.csv \
+      --output_dir results/comparison/
+
+  # Generate fairness HTML + PDF report:
+  python3 generate_fairness_report.py \
+      --baseline results/baseline_metrics.json \
+      --balanced results/balanced_metrics.json \
+      --output   reports/
+
+  # Test ML service (dummy mode, no model files needed):
+  python3 test_ml_service.py --dummy
+
+================================================================================
+  7. QUICK START  (all services at once)
+================================================================================
+
+Open 3 terminals:
+
+  # Terminal 1 — Backend
+  cd "/home/nexxus/Documents/Project Fairness/backend"
+  ML_DUMMY_MODE=true DIFFUSION_DUMMY_MODE=true \
+    .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Terminal 2 — Frontend
+  cd "/home/nexxus/Documents/Project Fairness/frontend"
+  npm run dev
+
+  # Terminal 3 — watch logs / run tests
+  tail -f /tmp/backend.log
+  python3 test_ml_service.py --dummy
+
+--- OR in one command (background all) ---
+
+  pkill -f "uvicorn main:app"; pkill -f vite
+  cd "/home/nexxus/Documents/Project Fairness/backend" && \
+    ML_DUMMY_MODE=true DIFFUSION_DUMMY_MODE=true \
+    nohup .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
+    > /tmp/backend.log 2>&1 &
+  cd "/home/nexxus/Documents/Project Fairness/frontend" && \
+    nohup npm run dev -- --host 0.0.0.0 --port 5173 \
+    > /tmp/frontend.log 2>&1 &
+  echo "All services started. Check /tmp/backend.log and /tmp/frontend.log"
+
+================================================================================
+  8. STOP ALL SERVICES
+================================================================================
+
+  pkill -f "uvicorn main:app"
+  pkill -f vite
+  pkill -f "celery -A tasks"
+
+================================================================================
+  9. URLs AT A GLANCE
+================================================================================
+
+  Frontend (React app)     http://localhost:5173
+  Backend API              http://localhost:8000
+  Swagger UI (API docs)    http://localhost:8000/docs
+  ReDoc (API docs)         http://localhost:8000/redoc
+  Health probe             http://localhost:8000/health
+  Readiness probe          http://localhost:8000/ready
+
+  Backend log              /tmp/backend.log
+  Frontend log             /tmp/frontend.log
+  SQLite DB                /home/nexxus/Documents/Project Fairness/backend/app.db
+  Static files             /home/nexxus/Documents/Project Fairness/backend/static/
+
+================================================================================
+  10. WHAT EACH SERVICE DOES
+================================================================================
+
+  FastAPI (port 8000)
+    • POST /api/predict        — classify a skin lesion image (EfficientNet-B3)
+    • POST /api/explain        — Grad-CAM + SHAP explanations
+    • POST /api/generate       — synthetic image generation (DDPM)
+    • GET  /api/history        — prediction history from SQLite
+    • GET  /api/metrics/fairness — fairness metrics (DPD, EOD, per-class AUC)
+    • GET  /api/dashboard/stats  — dashboard summary stats
+
+  React Frontend (port 5173)
+    • Dashboard    — stats overview, fairness scores, class distribution
+    • Predict      — drag & drop image upload, confidence gauge, Grad-CAM overlay
+    • History      — searchable table of past predictions
+    • Metrics      — before/after fairness charts, confusion matrix heatmap
+    • Generator    — synthetic image generation UI with class selector
+
+  SQLite (backend/app.db)
+    • Tables: predictions, synthetic_images, model_metrics,
+              fairness_reports, generation_jobs
+
+================================================================================

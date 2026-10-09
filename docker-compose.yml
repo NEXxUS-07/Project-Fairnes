@@ -1,0 +1,288 @@
+version: "3.9"
+
+# =============================================================================
+#  Project Fairness — Full Stack docker-compose
+#
+#  Services:
+#    db          — PostgreSQL 15 (persistent data volume)
+#    migrate     — Alembic one-shot migration runner
+#    api         — FastAPI backend  (GPU-capable)
+#    ml_worker   — Celery async worker for diffusion tasks (GPU-capable)
+#    frontend    — React SPA served by Nginx (proxies /api → api:8000)
+#
+#  Quick start:
+#    cp .env.example .env            # edit values as needed
+#    docker compose up -d            # start all services
+#    docker compose logs -f api      # stream API logs
+#    docker compose down -v          # stop + delete volumes
+#
+#  GPU (NVIDIA):
+#    Ensure nvidia-container-toolkit is installed on the host, then set
+#    ML_DEVICE=cuda and DIFFUSION_DEVICE=cuda in your .env file.
+# =============================================================================
+
+services:
+
+  # ── PostgreSQL 15 ───────────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: fairness_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-fairness}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fairness_secret}
+      POSTGRES_DB:       ${POSTGRES_DB:-skinlesion_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fairness} -d ${POSTGRES_DB:-skinlesion_db}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 15s
+    networks:
+      - fairness_net
+
+  # ── Redis (Celery broker + result backend) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: fairness_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  3
+    networks:
+      - fairness_net
+
+  # ── Alembic migration runner (one-shot, exits when done) ────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: fairness_migrate
+    restart: "no"
+    command: >
+      sh -c "cd /app/backend &&
+             alembic upgrade head &&
+             echo '✓ Migrations complete.'"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-fairness}:${POSTGRES_PASSWORD:-fairness_secret}@db:5432/${POSTGRES_DB:-skinlesion_db}"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - fairness_net
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: fairness_api
+    restart: unless-stopped
+    command: >
+      uvicorn main:app
+        --host 0.0.0.0
+        --port 8000
+        --workers ${UVICORN_WORKERS:-2}
+        --log-level ${LOG_LEVEL:-info}
+
+    environment:
+      # ── Database ────────────────────────────────────────────────────────────
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-fairness}:${POSTGRES_PASSWORD:-fairness_secret}@db:5432/${POSTGRES_DB:-skinlesion_db}"
+
+      # ── Task queue ──────────────────────────────────────────────────────────
+      CELERY_BROKER_URL:  "redis://redis:6379/0"
+      CELERY_RESULT_URL:  "redis://redis:6379/1"
+
+      # ── Security ────────────────────────────────────────────────────────────
+      SECRET_KEY:  ${SECRET_KEY:-CHANGE-ME-IN-PRODUCTION}
+      API_KEY:     ${API_KEY:-}
+
+      # ── CORS ────────────────────────────────────────────────────────────────
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5173}
+
+      # ── ML model paths (inside container) ───────────────────────────────────
+      ML_CHECKPOINT:        /app/models/best_model.pth
+      DIFFUSION_CHECKPOINT: /app/models/diffusion/ema_epoch0200.pt
+      FAIRNESS_REPORT_JSON: /app/models/fairness_report.json
+      METRICS_JSON:         /app/models/metrics.json
+
+      # ── ML runtime flags ────────────────────────────────────────────────────
+      ML_DEVICE:            ${ML_DEVICE:-cpu}
+      ML_ENABLE_GRADCAM:    ${ML_ENABLE_GRADCAM:-true}
+      ML_ENABLE_SHAP:       ${ML_ENABLE_SHAP:-false}
+      ML_DUMMY_MODE:        ${ML_DUMMY_MODE:-false}
+      DIFFUSION_DEVICE:     ${DIFFUSION_DEVICE:-cpu}
+      DIFFUSION_DUMMY_MODE: ${DIFFUSION_DUMMY_MODE:-false}
+
+      # ── Upload/generation limits ─────────────────────────────────────────────
+      MAX_UPLOAD_MB:     ${MAX_UPLOAD_MB:-10}
+      RATE_LIMIT_PREDICT: ${RATE_LIMIT_PREDICT:-20/minute}
+
+      # ── Logging ──────────────────────────────────────────────────────────────
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG:     ${DEBUG:-false}
+
+    volumes:
+      # ML model files (read-only from host ./models/ directory)
+      - ./models:/app/models:ro
+      # Uploaded images persist across restarts
+      - uploads_data:/app/backend/static/uploads
+      - uploads_data:/app/uploads
+      # Generated/explanation images
+      - generated_data:/app/backend/static/generated
+      - explanations_data:/app/backend/static/explanations
+
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 90s
+
+    # ── GPU support (NVIDIA) ──────────────────────────────────────────────────
+    # Requires: nvidia-container-toolkit installed on host
+    # Enable: set ML_DEVICE=cuda in .env
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all          # use "1" to pin to a single GPU
+              capabilities: [gpu]
+
+    networks:
+      - fairness_net
+
+  # ── Celery ML Worker (async diffusion / generation tasks) ───────────────────
+  ml_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: fairness_ml_worker
+    restart: unless-stopped
+    command: >
+      celery -A backend.tasks worker
+        --loglevel=${LOG_LEVEL:-info}
+        --concurrency=${CELERY_CONCURRENCY:-1}
+        --queues=generation,default
+        --hostname=worker@%h
+
+    environment:
+      # ── Database (worker may write job results) ─────────────────────────────
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-fairness}:${POSTGRES_PASSWORD:-fairness_secret}@db:5432/${POSTGRES_DB:-skinlesion_db}"
+
+      # ── Task queue ──────────────────────────────────────────────────────────
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_URL: "redis://redis:6379/1"
+
+      # ── ML model paths ───────────────────────────────────────────────────────
+      ML_CHECKPOINT:        /app/models/best_model.pth
+      DIFFUSION_CHECKPOINT: /app/models/diffusion/ema_epoch0200.pt
+      FAIRNESS_REPORT_JSON: /app/models/fairness_report.json
+      METRICS_JSON:         /app/models/metrics.json
+
+      # ── Runtime flags ────────────────────────────────────────────────────────
+      ML_DEVICE:            ${ML_DEVICE:-cpu}
+      DIFFUSION_DEVICE:     ${DIFFUSION_DEVICE:-cpu}
+      DIFFUSION_DUMMY_MODE: ${DIFFUSION_DUMMY_MODE:-false}
+      ML_DUMMY_MODE:        ${ML_DUMMY_MODE:-false}
+      LOG_LEVEL:            ${LOG_LEVEL:-INFO}
+
+    volumes:
+      - ./models:/app/models:ro
+      - generated_data:/app/backend/static/generated
+      - explanations_data:/app/backend/static/explanations
+      - uploads_data:/app/uploads
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+    # ── GPU support ───────────────────────────────────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    networks:
+      - fairness_net
+
+  # ── React Frontend (Nginx) ───────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fairness_frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - fairness_net
+
+# =============================================================================
+#  NAMED VOLUMES
+# =============================================================================
+
+volumes:
+  postgres_data:
+    driver: local
+    labels:
+      com.fairness.description: "PostgreSQL 15 persistent data"
+
+  uploads_data:
+    driver: local
+    labels:
+      com.fairness.description: "User-uploaded dermoscopy images"
+
+  generated_data:
+    driver: local
+    labels:
+      com.fairness.description: "DDPM-generated synthetic images"
+
+  explanations_data:
+    driver: local
+    labels:
+      com.fairness.description: "Grad-CAM and SHAP explanation images"
+
+# =============================================================================
+#  NETWORKS
+# =============================================================================
+
+networks:
+  fairness_net:
+    driver: bridge
+    labels:
+      com.fairness.description: "Internal network — all services communicate here"
